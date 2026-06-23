@@ -14,17 +14,27 @@ from src.utils import load_departments, select_region_interactively, download_fi
 parser = argparse.ArgumentParser(description="Descargar formularios E-14 de Colombia.")
 parser.add_argument("--dep", type=str, help="Código de departamento (2 dígitos, ej. 01)")
 parser.add_argument("--mun", type=str, help="Código de municipio (3 dígitos, ej. 280)")
+parser.add_argument("--all", action="store_true", help="Descargar todos los departamentos y municipios de Colombia")
+parser.add_argument("--no-capitals", action="store_true", help="Descargar solo municipios no capitales (ignorar código '001')")
+parser.add_argument("--only-capitals", action="store_true", help="Descargar solo municipios capitales (código '001')")
 parser.add_argument("--redownload", action="store_true", help="Forzar la descarga de la base de datos de códigos")
 args = parser.parse_args()
 
-if args.dep and args.mun:
+dep = None
+mun = None
+
+if args.all:
+    print("Modo CLI - Descargando todos los departamentos y municipios de Colombia")
+elif args.dep:
     dep = args.dep.zfill(2)
-    mun = args.mun.zfill(3)
-    print(f"Usando argumentos CLI - Departamento: {dep}, Municipio: {mun}")
+    if args.mun:
+        mun = args.mun.zfill(3)
+        print(f"Modo CLI - Departamento: {dep}, Municipio: {mun}")
+    else:
+        print(f"Modo CLI - Descargando todo el Departamento: {dep}")
 else:
     deps = load_departments()
     dep, mun = select_region_interactively(deps)
-# La autenticación de AWS Cognito fue removida ya que las descargas de PDFs se realizan de forma pública/anónima.
 
 ## DESCARGAR JSON DE CODIGOS
 codes_path = os.path.join("data", "allTransmissionCodes.json")
@@ -71,28 +81,58 @@ def iter_nodes(obj):
         for chunk in nodes:
             if isinstance(chunk, dict):
                 yield chunk
-
             elif isinstance(chunk, list):
                 yield from chunk
 
-def filtrar(obj, dep, mun):
+def filtrar(obj, dep=None, mun=None, no_capitals=False, only_capitals=False):
     for node in iter_nodes(obj):
+        dep_node = node.get("idDepartmentCode")
+        mun_node = node.get("municipalityCode")
+        
+        # Ignorar Consulados (departamento 88)
+        if dep_node == "88":
+            continue
+            
+        # Si se filtró por departamento específico
+        if dep is not None and dep_node != dep:
+            continue
+            
+        # Si se filtró por municipio específico
+        if mun is not None and mun_node != mun:
+            continue
+            
+        # Si no queremos capitales, omitimos el código '001'
+        if no_capitals and mun_node == "001":
+            continue
+            
+        # Si queremos solo capitales, omitimos los que no tengan el código '001'
+        if only_capitals and mun_node != "001":
+            continue
+            
+        yield {
+            "dep": dep_node,
+            "mun": mun_node.zfill(3),
+            "zona": node.get("idZoneCode").zfill(3),
+            "puesto": node.get("standCode"),
+            "mesa": node.get("numberStand"),
+            "expected_name": node.get("expectedName"),
+        }
 
-        if (
-            node.get("idDepartmentCode") == dep
-            and (mun is None or node.get("municipalityCode") == mun)
-        ):
-            yield {
-                "dep": node.get("idDepartmentCode"),
-                "mun": node.get("municipalityCode").zfill(3),
-                "zona": node.get("idZoneCode").zfill(3),
-                "puesto": node.get("standCode"),
-                "mesa": node.get("numberStand"),
-                "expected_name": node.get("expectedName"),
-            }
+resultados = list(filtrar(data, dep, mun, args.no_capitals, args.only_capitals))
+print(f"Total general de actas encontradas para descargar: {len(resultados)}")
 
-resultados=list(filtrar(data, dep, mun))
-print(f"{len(resultados)} actas encontradas.")
+# Agrupar por (departamento, municipio) para procesar ordenadamente
+from collections import defaultdict
+actas_por_municipio = defaultdict(list)
+for el in resultados:
+    actas_por_municipio[(el["dep"], el["mun"])].append(el)
+
+municipios_a_procesar = sorted(actas_por_municipio.keys())
+total_municipios = len(municipios_a_procesar)
+print(f"Se procesarán {total_municipios} municipios.")
+
+# Importar helper para nombres de regiones
+from src.utils import get_region_names
 
 ### DESCARGAR PDFS
 def build_pdf_url(dep, mun, zona, puesto, mesa, corp_text, expected_name):
@@ -118,49 +158,54 @@ def download_pdf(url, path):
     with open(path, "wb") as f:
         f.write(r.content)
 
-# Crear subcarpeta para departamento y municipio encadenados (ej. pdf/01280)
-folder_name = f"{dep}{mun}"
-folder_path = os.path.join("pdf", folder_name)
-os.makedirs(folder_path, exist_ok=True)
-
-# Guardar la lista de actas en un archivo CSV local para auditoría
-csv_path = os.path.join(folder_path, "actas_mapeo.csv")
-try:
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["dep", "mun", "zona", "puesto", "mesa", "expected_name"])
-        writer.writeheader()
-        writer.writerows(resultados)
-    print(f"Se guardó la lista de códigos en formato CSV en: {csv_path}")
-except Exception as e:
-    print(f"Advertencia: No se pudo guardar la lista en CSV: {e}")
-
-print(f"Los archivos se guardarán en la carpeta: {folder_path}")
-
-for el in resultados:
-    dep=el["dep"]
-    mun=el["mun"]
-    zona=el["zona"]
-    puesto=el["puesto"]
-    mesa=el["mesa"]
-    pdfname=el["expected_name"]
-    corp="PRE"
-
-    # Nombre de archivo sin timestamp T{hora} para mantener consistencia e idempotencia
-    filename=f"Dep{dep}-Mun{mun}-Zona{zona}-Puesto{puesto}-Mesa{mesa}_{pdfname}"
-    if not filename.endswith(".pdf"):
-        filename += ".pdf"
+# Procesar cada municipio secuencialmente
+for m_idx, (dep_c, mun_c) in enumerate(municipios_a_procesar):
+    m_list = actas_por_municipio[(dep_c, mun_c)]
+    dep_name, mun_name = get_region_names(dep_c, mun_c)
+    region_label = f"{dep_name} - {mun_name}" if dep_name else f"Dep {dep_c} - Mun {mun_c}"
     
-    filepath = os.path.join(folder_path, filename)
+    print(f"\n======================================================================")
+    print(f" [Municipio {m_idx + 1}/{total_municipios}] {region_label} ({len(m_list)} actas)")
+    print(f"======================================================================")
     
-    # Idempotencia: Verificar si ya existe el archivo
-    if os.path.exists(filepath):
-        print(f"Saltando: Mun {mun} - Zona {zona} - Puesto {puesto} - Mesa {mesa} (Ya existe)")
-        continue
-
-    print(f"Descargando: Mun {mun} - Zona {zona} - Puesto {puesto} - Mesa {mesa}")
+    folder_name = f"{dep_c}{mun_c}"
+    folder_path = os.path.join("pdf", folder_name)
+    os.makedirs(folder_path, exist_ok=True)
+    
+    # Escribir actas_mapeo.csv para este municipio
+    csv_path = os.path.join(folder_path, "actas_mapeo.csv")
     try:
-        download_pdf(build_pdf_url(dep,mun,zona,puesto,mesa,corp,pdfname), filepath)
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["dep", "mun", "zona", "puesto", "mesa", "expected_name"])
+            writer.writeheader()
+            writer.writerows(m_list)
     except Exception as e:
-        print(f"Error al descargar Mun {mun} - Zona {zona} - Puesto {puesto} - Mesa {mesa}: {e}")
+        print(f"  Advertencia: No se pudo guardar actas_mapeo.csv: {e}")
+        
+    for idx, el in enumerate(m_list):
+        zona = el["zona"]
+        puesto = el["puesto"]
+        mesa = el["mesa"]
+        pdfname = el["expected_name"]
+        corp = "PRE"
+        
+        filename = f"Dep{dep_c}-Mun{mun_c}-Zona{zona}-Puesto{puesto}-Mesa{mesa}_{pdfname}"
+        if not filename.endswith(".pdf"):
+            filename += ".pdf"
+            
+        filepath = os.path.join(folder_path, filename)
+        
+        if os.path.exists(filepath):
+            # Imprimir solo reporte resumido cada 10 archivos existentes para no inundar el log en descargas masivas
+            if idx % 10 == 0 or idx == len(m_list) - 1:
+                print(f"  [{idx + 1}/{len(m_list)}] Saltando: Mesa {mesa} y anteriores (Ya existe)")
+            continue
+            
+        print(f"  [{idx + 1}/{len(m_list)}] Descargando: Mesa {mesa} ...")
+        try:
+            url = build_pdf_url(dep_c, mun_c, zona, puesto, mesa, corp, pdfname)
+            download_pdf(url, filepath)
+        except Exception as e:
+            print(f"    [-] Error al descargar Mesa {mesa}: {e}")
 
-print("====FINALIZADO====")
+print("\n==== PROCESO DE DESCARGA FINALIZADO ====")

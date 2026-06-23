@@ -50,8 +50,21 @@ python cli/descargar.py
   python cli/descargar.py --dep 01 --mun 280
   ```
   *(01 es Antioquia, 280 es Turbo. El script guardará los PDFs en la carpeta `pdf/01280`).*
+* **Modo Masivo (No Capitales)**: Si quieres descargar automáticamente las actas de todos los municipios de Colombia exceptuando las capitales departamentales (cuyo código interno de municipio es `"001"` y omitiendo Consulados), ejecuta:
+  ```bash
+  python cli/descargar.py --all --no-capitals
+  ```
+  *También puedes combinar estas banderas para un departamento en particular. Por ejemplo, para descargar todos los municipios no capitales de Boyacá (`07`):*
+  ```bash
+  python cli/descargar.py --dep 07 --no-capitals
+  ```
+* **Modo Masivo (Solo Capitales)**: Si quieres descargar únicamente las capitales departamentales (municipios con código `"001"`) de todos los departamentos, ejecuta:
+  ```bash
+  python cli/descargar.py --all --only-capitals
+  ```
 
 ---
+
 
 ### Paso 2: Subir y Crear Notebooks en NotebookLM
 
